@@ -43,6 +43,7 @@ import {
   type Track,
 } from "./data";
 import { getAlbumTracks, getArtistTop, getPreview, searchMusic } from "./services/deezer";
+import { createYouTubePlayer, findVideoId, hasYouTubeKey, searchYouTube, type YTPlayer } from "./services/youtube";
 
 type Section = "trending" | "artists" | "albums" | "editorials";
 type View =
@@ -329,9 +330,27 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const playRequest = useRef(0);
+  const [playerMode, setPlayerMode] = useState<"preview" | "youtube">("preview");
+  const ytRef = useRef<YTPlayer | null>(null);
+  const ytPromise = useRef<Promise<YTPlayer> | null>(null);
+  const ytBoxRef = useRef<HTMLDivElement>(null);
+  const usingYt = useRef(false);
+  const ytStateHandler = useRef<(state: number) => void>(() => {});
+  const ytErrorHandler = useRef<(code: number) => void>(() => {});
 
   useEffect(() => { localStorage.setItem("spotify-demo-playlists", JSON.stringify(playlists)); }, [playlists]);
   useEffect(() => { localStorage.setItem("spotify-demo-liked", JSON.stringify(likedTracks)); }, [likedTracks]);
+  useEffect(() => {
+    if (!isPlaying || playerMode !== "youtube") return;
+    const timer = window.setInterval(() => {
+      const player = ytRef.current;
+      if (!player || !usingYt.current) return;
+      setProgress(player.getCurrentTime() || 0);
+      const duration = player.getDuration();
+      if (duration > 0) setPreviewDuration(duration);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, playerMode]);
 
   useEffect(() => {
     document.title = view.type === "home"
@@ -362,7 +381,10 @@ export default function App() {
     let active = true;
     setSearchLoading(true);
     const timer = window.setTimeout(() => {
-      searchMusic(query.trim())
+      Promise.all([
+        searchMusic(query.trim()).catch(() => [] as Track[]),
+        hasYouTubeKey() ? searchYouTube(query.trim()).catch(() => [] as Track[]) : Promise.resolve([] as Track[]),
+      ]).then(([deezerTracks, youtubeTracks]) => [...youtubeTracks, ...deezerTracks])
         .then((results) => { if (active) setRemoteResults(results); })
         .catch(() => { if (active) setRemoteResults([]); })
         .finally(() => { if (active) setSearchLoading(false); });
@@ -492,7 +514,36 @@ export default function App() {
     setToast(isLiked ? "Removed from Liked Songs" : "Added to Liked Songs");
   }
 
+  function setEngineVolume(value: number) {
+    setEngineVolume(value);
+    ytRef.current?.setVolume(value);
+  }
+
+  function seekTo(seconds: number) {
+    if (usingYt.current) ytRef.current?.seekTo(seconds, true);
+    else if (audioRef.current) audioRef.current.currentTime = seconds;
+  }
+
+  async function ensureYtPlayer(): Promise<YTPlayer> {
+    if (ytRef.current) return ytRef.current;
+    if (!ytPromise.current) {
+      const box = ytBoxRef.current;
+      if (!box) throw new Error("Player container missing");
+      ytPromise.current = createYouTubePlayer(box, {
+        onState: (state) => ytStateHandler.current(state),
+        onError: (code) => ytErrorHandler.current(code),
+      }).then((player) => { ytRef.current = player; return player; }).catch((error) => { ytPromise.current = null; throw error; });
+    }
+    return ytPromise.current;
+  }
+
   function togglePlayback() {
+    if (usingYt.current) {
+      const player = ytRef.current;
+      if (!player || !currentTrack || audioLoading) return;
+      if (player.getPlayerState() === 1) player.pauseVideo(); else player.playVideo();
+      return;
+    }
     const audio = audioRef.current;
     if (!audio || !currentTrack || audioLoading) return;
     if (audio.paused) {
@@ -510,12 +561,35 @@ export default function App() {
     if (!audio) return;
     audio.pause();
     audio.removeAttribute("src");
+    try { ytRef.current?.stopVideo(); } catch { /* player not ready */ }
+    usingYt.current = false;
+    setPlayerMode("preview");
     setCurrentTrack(track);
     setQueue(playQueue.length ? playQueue : [track]);
     setIsPlaying(false);
     setAudioLoading(true);
     setProgress(0);
     setPreviewDuration(30);
+    if (hasYouTubeKey()) {
+      try {
+        const videoId = track.videoId || (await findVideoId(track));
+        if (request !== playRequest.current) return;
+        if (videoId) {
+          const player = await ensureYtPlayer();
+          if (request !== playRequest.current) return;
+          usingYt.current = true;
+          setPlayerMode("youtube");
+          player.setVolume(volume);
+          player.loadVideoById(videoId);
+          setAudioLoading(false);
+          return;
+        }
+      } catch {
+        if (request !== playRequest.current) return;
+        usingYt.current = false;
+        setPlayerMode("preview");
+      }
+    }
     try {
       const url = track.previewUrl || (await getPreview(track.id));
       if (request !== playRequest.current) return;
@@ -542,10 +616,36 @@ export default function App() {
 
   function playPrevious() {
     if (!currentTrack || !queue.length) return;
-    if (progress > 3 && audioRef.current) { audioRef.current.currentTime = 0; return; }
+    if (progress > 3) { seekTo(0); return; }
     const index = queue.findIndex((track) => track.id === currentTrack.id);
     void playTrack(queue[(index - 1 + queue.length) % queue.length], queue, true);
   }
+
+  function handleEnded() {
+    if (repeat) {
+      seekTo(0);
+      if (usingYt.current) ytRef.current?.playVideo(); else void audioRef.current?.play();
+    } else if (queue.length > 1) playNext();
+    else setIsPlaying(false);
+  }
+
+  ytStateHandler.current = (state) => {
+    if (!usingYt.current) return;
+    if (state === 1) {
+      setIsPlaying(true);
+      setAudioLoading(false);
+      const duration = ytRef.current?.getDuration();
+      if (duration && duration > 0) setPreviewDuration(duration);
+    } else if (state === 2) setIsPlaying(false);
+    else if (state === 0) handleEnded();
+  };
+
+  ytErrorHandler.current = () => {
+    if (!usingYt.current) return;
+    setIsPlaying(false);
+    setToast("This video can't be played here.");
+    if (queue.length > 1) playNext();
+  };
 
   async function playAlbum(album: Album) {
     try {
@@ -948,14 +1048,14 @@ export default function App() {
               <button type="button" aria-label="Next song" title="Next" onClick={playNext}><SkipForward size={19} fill="currentColor" /></button>
               <button type="button" className={repeat ? "control-on" : ""} aria-label="Repeat" title="Repeat" onClick={() => setRepeat((value) => !value)}><Repeat2 size={17} /></button>
             </div>
-            <div className="player-timeline"><span>{formatTime(progress)}</span><input type="range" min="0" max={previewDuration || 30} step="0.1" value={Math.min(progress, previewDuration || 30)} style={{ "--range-fill": `${Math.min(100, (progress / (previewDuration || 30)) * 100)}%` } as CSSProperties} aria-label="Seek preview" onChange={(event) => { const time = Number(event.target.value); if (audioRef.current) audioRef.current.currentTime = time; setProgress(time); }} /><span>{formatTime(previewDuration)}</span></div>
+            <div className="player-timeline"><span>{formatTime(progress)}</span><input type="range" min="0" max={previewDuration || 30} step="0.1" value={Math.min(progress, previewDuration || 30)} style={{ "--range-fill": `${Math.min(100, (progress / (previewDuration || 30)) * 100)}%` } as CSSProperties} aria-label="Seek preview" onChange={(event) => { const time = Number(event.target.value); seekTo(time); setProgress(time); }} /><span>{formatTime(previewDuration)}</span></div>
           </div>
           <div className="player-extras">
-            <span className="preview-label">Preview</span>
+            <span className="preview-label">{playerMode === "youtube" ? "YouTube" : "Preview"}</span>
             <button type="button" title="Lyrics unavailable in preview" aria-label="Lyrics unavailable in preview" onClick={() => setToast("Lyrics are not available in the demo preview.")}><Mic2 size={17} /></button>
             <button type="button" title="Queue" aria-label="Queue" onClick={() => setToast(`${queue.length} songs in your queue`)}><ListMusic size={18} /></button>
-            <button type="button" title={volume === 0 ? "Unmute" : "Mute"} aria-label={volume === 0 ? "Unmute" : "Mute"} onClick={() => { if (volume === 0) { setVolume(lastVolume || 75); if (audioRef.current) audioRef.current.volume = (lastVolume || 75) / 100; } else { setLastVolume(volume); setVolume(0); if (audioRef.current) audioRef.current.volume = 0; } }}>{volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
-            <input className="volume-range" type="range" min="0" max="100" value={volume} style={{ "--range-fill": `${volume}%` } as CSSProperties} aria-label="Volume" onChange={(event) => { const value = Number(event.target.value); setVolume(value); if (audioRef.current) audioRef.current.volume = value / 100; }} />
+            <button type="button" title={volume === 0 ? "Unmute" : "Mute"} aria-label={volume === 0 ? "Unmute" : "Mute"} onClick={() => { if (volume === 0) { setVolume(lastVolume || 75); setEngineVolume(lastVolume || 75); } else { setLastVolume(volume); setVolume(0); setEngineVolume(0); } }}>{volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+            <input className="volume-range" type="range" min="0" max="100" value={volume} style={{ "--range-fill": `${volume}%` } as CSSProperties} aria-label="Volume" onChange={(event) => { const value = Number(event.target.value); setVolume(value); setEngineVolume(value); }} />
             <button type="button" title="Fullscreen" aria-label="Fullscreen" onClick={() => document.documentElement.requestFullscreen?.().catch(() => setToast("Fullscreen is not available."))}><Maximize2 size={16} /></button>
           </div>
         </div>
@@ -966,8 +1066,10 @@ export default function App() {
       <audio ref={audioRef}
         onTimeUpdate={(event) => setProgress(event.currentTarget.currentTime)}
         onLoadedMetadata={(event) => setPreviewDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 30)}
-        onEnded={() => { if (repeat && audioRef.current) { audioRef.current.currentTime = 0; void audioRef.current.play(); } else if (queue.length > 1) playNext(); else setIsPlaying(false); }}
+        onEnded={handleEnded}
         onError={() => { if (currentTrack && !audioLoading) { setIsPlaying(false); setToast("This preview could not be played."); } }} />
+
+      <div ref={ytBoxRef} className={`yt-mini ${playerMode === "youtube" && currentTrack ? "" : "yt-hidden"}`} aria-label="YouTube player" />
 
       {toast && <div className="toast" role="status">{toast}</div>}
 

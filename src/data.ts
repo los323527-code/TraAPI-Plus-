@@ -8,6 +8,7 @@ export type Track = {
   duration?: number;
   explicit?: boolean;
   previewUrl?: string;
+  videoId?: string;
 };
 
 export type Artist = {

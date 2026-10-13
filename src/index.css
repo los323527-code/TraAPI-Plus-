@@ -481,3 +481,9 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border: 0; bo
 .library-collapsed .library-filters, .library-collapsed .library-tools { display: none; }
 @media (max-width: 1140px) { .quick-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .page-title { padding: 0 16px; font-size: 24px; } .quick-grid { padding: 0 16px 8px; gap: 8px; } .quick-pick { height: 56px; } .quick-cover { width: 56px; height: 56px; flex-basis: 56px; } }
+
+/* ---- YouTube player ---- */
+.yt-mini { position: fixed; right: 16px; bottom: 104px; z-index: 40; width: 200px; height: 200px; overflow: hidden; border-radius: 8px; background: #000; box-shadow: 0 8px 24px #0009; }
+.yt-mini iframe { display: block; width: 100%; height: 100%; border: 0; }
+.yt-hidden { left: -9999px; right: auto; }
+@media (max-width: 700px) { .yt-mini { bottom: 150px; right: 8px; } }
